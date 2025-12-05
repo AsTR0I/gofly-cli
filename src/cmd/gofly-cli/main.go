@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"gofly-cli/internal/model"
+	"gofly-cli/internal/parser"
 	"net"
 	"os"
 	"regexp"
@@ -15,50 +17,56 @@ import (
 )
 
 var (
-	appVersion = "25.11.28.19"
-	activeLogs int
-	tsRegexp   = regexp.MustCompile(`^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]`)
-	hotBar     *tview.TextView
-	input      *tview.InputField
+	appVersion  = "25.12.4"
+	activeLogs  int
+	tsRegexp    = regexp.MustCompile(`^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]`)
+	hotBar      *tview.TextView
+	input       *tview.InputField
+	searchTimer *time.Timer
+	isSearching bool
+
 	logTable   *tview.Table
 	statusBar  *tview.Flex
 	app        *tview.Application
 	flex       *tview.Flex
 	serverAddr string
 	// хранения всех логов и фильтра
-	allLogs       []LogEntry
+	allLogs       []model.LogEntry
 	currentFilter string
 	currentMode   string
 	inputFile     string
 	// буфер для обработки файлов
-	logBatch  []LogEntry
+	logBatch  []model.LogEntry
 	batchSize = 100
 
 	sessionColors = make(map[string]tcell.Color)
 	colorIndex    = 0
+
+	lastSubAck    = time.Now()
+	isConnected   = false
+	alreadyWarned = false
+
+	autoScroll = false
 )
 
-// Структура для хранения логов
-type LogEntry struct {
-	Index           string
-	Timestamp       string
-	Level           string
-	LevelColor      tcell.Color
-	Message         string
-	OriginalMessage string
-	CallID          string
-}
-
 func main() {
-	ip := flag.String("ip", "127.0.0.1", "server IP")
-	port := flag.String("port", "9091", "server port")
-	inputFilePtr := flag.String("I", "", "Input file path (optional)")
+	ip := flag.String("ip", "127.0.0.1", "Set custom server IP. [-ip %host%]")
+	port := flag.String("port", "9090", "Set custom server PORT. [-port %port%]")
+	help := flag.Bool("h", false, "Prints flags and their descriptions")
+	inputFilePtr := flag.String("I", "", "Change the mod of app from connect and reading UDP to parse the FILE. [-I %path to file%]")
 	flag.Parse()
+
+	if *help {
+		fmt.Println("gofly-cli — CLI for gofly")
+		fmt.Println("Usage: gofly-cli [-h | -I filename | [-ip host][-port port]]")
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
 
 	serverAddr = fmt.Sprintf("%s:%s", *ip, *port)
 	inputFile = *inputFilePtr
-	allLogs = make([]LogEntry, 0)
-	logBatch = make([]LogEntry, 0, batchSize)
+	allLogs = make([]model.LogEntry, 0)
+	logBatch = make([]model.LogEntry, 0, batchSize)
 
 	if inputFile != "" {
 		currentMode = fmt.Sprintf("File [%s]", inputFile)
@@ -102,20 +110,46 @@ func main() {
 		SetPlaceholder("Enter filter text...").
 		SetFieldWidth(50).
 		SetChangedFunc(func(text string) {
-			// Auto apply filter
-			currentFilter = strings.TrimSpace(text)
-			if currentFilter != "" {
-				applyFilter(currentFilter)
-			} else {
-				clearFilter()
+
+			if !isSearching && text != "" {
+				isSearching = true
+				updateStatusBar(len(allLogs), "typing...")
 			}
+
+			if searchTimer != nil {
+				searchTimer.Stop()
+			}
+
+			searchTimer = time.AfterFunc(750*time.Millisecond, func() {
+				app.QueueUpdateDraw(func() {
+					isSearching = false
+					currentFilter = strings.TrimSpace(text)
+					if currentFilter != "" {
+						applyFilter(currentFilter)
+					} else {
+						clearFilter()
+					}
+				})
+			})
 		}).
 		SetDoneFunc(func(key tcell.Key) {
+			if searchTimer != nil {
+				searchTimer.Stop()
+				isSearching = false
+			}
+
 			switch key {
 			case tcell.KeyEnter:
+				currentFilter = strings.TrimSpace(input.GetText())
+				if currentFilter != "" {
+					applyFilter(currentFilter)
+				} else {
+					clearFilter()
+				}
 				app.SetFocus(logTable)
 			case tcell.KeyEsc:
 				input.SetText("")
+				clearFilter()
 				app.SetFocus(logTable)
 			}
 		})
@@ -160,7 +194,9 @@ func main() {
 
 	//  bottom (hottab)
 	hotBar = tview.NewTextView().SetDynamicColors(true)
-	hotBar.SetText("Esc Quit   F1 Help   F3 Focus Filter   F4 Clear Filter   F5 Clear")
+	hotBar.
+		SetDynamicColors(true).
+		SetText("[yellow]Esc\\Q[-] Quit   [green]F1[-] Help   [green]F3[-] Focus Filter   [green]F4[-] Clear Filter   [green]F5[-] Clear   [red]F6[-] AutoScroll")
 	hotBar.SetBorder(true)
 	hotBar.SetTitle(" Hotkeys ")
 
@@ -178,6 +214,7 @@ func main() {
 				app.SetFocus(logTable)
 			} else {
 				app.Stop()
+				os.Exit(0)
 			}
 		case tcell.KeyF1:
 			showHelp()
@@ -188,9 +225,22 @@ func main() {
 			clearFilter()
 		case tcell.KeyF5:
 			clearLogs()
+		case tcell.KeyF6:
+			autoScroll = !autoScroll
+			updateHotBar(hotBar, autoScroll)
+			app.Draw()
 		}
-		return event
 
+		switch event.Rune() {
+		case 'q', 'Q':
+			if app.GetFocus() != input {
+				app.Stop()
+				os.Exit(0)
+				return nil
+			}
+		}
+
+		return event
 	})
 
 	//  from file данных
@@ -235,6 +285,7 @@ func main() {
 			return
 		}
 
+		// GUI startup
 		appStarted := make(chan bool, 1)
 		go func() {
 			if err := app.SetRoot(flex, true).Run(); err != nil {
@@ -243,22 +294,38 @@ func main() {
 			appStarted <- true
 		}()
 
-		processLineRealtime(fmt.Sprintf("[INFO] UDP client started. Local: %s, Server: %s",
-			conn.LocalAddr().String(), serverAddr))
+		processLineRealtime(logWithTime("INFO", fmt.Sprintf("Connecting to %s", serverAddr)))
+		lastSubAck = time.Now()
 
-		// SUB every 5 sec
+		// SUB every 0.5x= sec
 		go func() {
-			ticker := time.NewTicker(5 * time.Second)
+			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
 
 			for {
-				select {
-				case <-ticker.C:
-					_, err := conn.WriteToUDP([]byte("SUB"), serverUDP)
-					if err != nil {
-						errorMsg := fmt.Sprintf("[ERROR] Failed to send SUB to %s: %v", serverAddr, err)
-						processLineRealtime(errorMsg)
+				<-ticker.C
+				_, err := conn.WriteToUDP([]byte("SUB"), serverUDP)
+				if err != nil {
+					processLineRealtime(logWithTime("WARN", fmt.Sprintf("SUB send error: %v", err)))
+				}
+
+				if time.Since(lastSubAck) > 1*time.Second {
+					if !isConnected {
+						if !alreadyWarned {
+							processLineRealtime(logWithTime("WARN",
+								fmt.Sprintf("Lost connection to %s", serverAddr)))
+							alreadyWarned = true
+						}
 					}
+					isConnected = false
+				} else {
+					if !isConnected {
+						processLineRealtime(logWithTime("INFO",
+							fmt.Sprintf("Reconnected to %s", serverAddr)))
+					}
+
+					isConnected = true
+					alreadyWarned = false
 				}
 			}
 		}()
@@ -273,15 +340,30 @@ func main() {
 						processLineRealtime("[INFO] UDP connection closed")
 						return
 					}
-					errorMsg := fmt.Sprintf("[ERROR] Failed to read from UDP: %v", err)
-					processLineRealtime(errorMsg)
+					processLineRealtime(fmt.Sprintf("[ERROR] UDP read: %v", err))
 					continue
 				}
 
-				line := string(buf[:n])
-				processLineRealtime(line)
+				msg := strings.TrimSpace(string(buf[:n]))
+
+				if strings.HasPrefix(msg, "SUB_ACK") {
+					lastSubAck = time.Now()
+
+					if !isConnected {
+						isConnected = true
+						processLineRealtime(logWithTime("INFO", fmt.Sprintf(
+							"Connected. Local: %s, Server: %s",
+							conn.LocalAddr().String(), serverAddr,
+						)))
+
+					}
+					continue
+				}
+
+				processLineRealtime(msg)
 			}
 		}()
+
 	}
 
 	if err := app.SetRoot(flex, true).Run(); err != nil {
@@ -290,7 +372,7 @@ func main() {
 }
 
 func processLine(line string) {
-	logEntry := parseLogLine(line, len(allLogs)+len(logBatch))
+	logEntry := parser.ParseLogLine(line, len(allLogs)+len(logBatch))
 	logBatch = append(logBatch, logEntry)
 
 	if len(logBatch) >= batchSize {
@@ -299,7 +381,7 @@ func processLine(line string) {
 }
 
 func processLineRealtime(line string) {
-	logEntry := parseLogLine(line, len(allLogs))
+	logEntry := parser.ParseLogLine(line, len(allLogs))
 
 	app.QueueUpdateDraw(func() {
 		allLogs = append(allLogs, logEntry)
@@ -337,8 +419,10 @@ func processLineRealtime(line string) {
 			// add style to row
 			setRowStyle(row, idxCell, timeCell, levelCell, msgCell)
 
-			logTable.Select(row, 0)
-			logTable.ScrollToEnd()
+			if autoScroll {
+				logTable.Select(row, 0)
+				logTable.ScrollToEnd()
+			}
 
 			displayedCount := logTable.GetRowCount() - 1
 			updateStatusBar(displayedCount, currentFilter)
@@ -363,56 +447,25 @@ func processLineRealtime(line string) {
 		setRowStyle(row, idxCell, timeCell, levelCell, msgCell)
 
 		updateStatusBar(len(allLogs), "")
-		logTable.ScrollToEnd()
-		logTable.Select(row, 0)
+		if autoScroll {
+			logTable.Select(row, 0)
+			logTable.ScrollToEnd()
+		}
+
 	})
 }
 
-func parseLogLine(line string, index int) LogEntry {
-	timestamp := ""
-	originalLine := line
-
-	if len(line) > 20 && line[0] == '[' {
-		if idx := strings.Index(line, "]"); idx != -1 {
-			timestamp = line[1:idx]
-			line = strings.TrimSpace(line[idx+1:])
-		}
+func clearLogs() {
+	for i := logTable.GetRowCount() - 1; i > 0; i-- {
+		logTable.RemoveRow(i)
 	}
+	allLogs = make([]model.LogEntry, 0)
+	logBatch = make([]model.LogEntry, 0, batchSize)
+	activeLogs = 0
+	currentFilter = ""
+	input.SetText("")
 
-	levelText, levelColor := levelColoredFast(line)
-	messageText := decodeMessageFast(line)
-
-	return LogEntry{
-		Index:           fmt.Sprintf("%d", index),
-		Timestamp:       timestamp,
-		Level:           levelText,
-		LevelColor:      levelColor,
-		Message:         messageText,
-		OriginalMessage: originalLine,
-	}
-}
-
-func levelColoredFast(line string) (string, tcell.Color) {
-	switch {
-	case strings.Contains(line, "[DEBUG]"):
-		return "DEBUG", tcell.ColorDarkCyan
-	case strings.Contains(line, "[INFO]"):
-		return "INFO", tcell.ColorGreen
-	case strings.Contains(line, "[WARN]"):
-		return "WARN", tcell.ColorYellow
-	case strings.Contains(line, "[ERROR]"):
-		return "ERROR", tcell.ColorRed
-	default:
-		return "", tcell.ColorWhite
-	}
-}
-
-func decodeMessageFast(line string) string {
-	line = strings.ReplaceAll(line, "[DEBUG]", "")
-	line = strings.ReplaceAll(line, "[INFO]", "")
-	line = strings.ReplaceAll(line, "[WARN]", "")
-	line = strings.ReplaceAll(line, "[ERROR]", "")
-	return strings.TrimSpace(line)
+	updateStatusBar(0, "")
 }
 
 func flushLogBatch() {
@@ -474,7 +527,10 @@ func flushLogBatch() {
 				setRowStyle(row, idxCell, timeCell, levelCell, msgCell)
 			}
 			updateStatusBar(len(allLogs), "")
-			logTable.ScrollToEnd()
+			if autoScroll {
+				logTable.ScrollToEnd()
+			}
+
 		}
 
 		logBatch = logBatch[:0]
@@ -592,7 +648,17 @@ func updateStatusBar(displayed int, filter string) {
 	firstLine := statusBar.GetItem(0).(*tview.Flex)
 	infoText := firstLine.GetItem(0).(*tview.TextView)
 
-	if filter != "" {
+	if filter == "typing..." {
+		if inputFile != "" {
+			infoText.SetText(fmt.Sprintf(
+				"gofly-cli v.%s    Mode: Typing...    %s    Logs: %d",
+				appVersion, currentMode, len(allLogs)))
+		} else {
+			infoText.SetText(fmt.Sprintf(
+				"gofly-cli v.%s    Mode: Typing...    [%s]    Logs: %d",
+				appVersion, serverAddr, len(allLogs)))
+		}
+	} else if filter != "" {
 		if inputFile != "" {
 			infoText.SetText(fmt.Sprintf(
 				"gofly-cli v.%s    Mode: Filtered    %s    Logs: %d/%d",
@@ -632,26 +698,6 @@ func showHelp() {
 	app.SetRoot(modal, true).SetFocus(modal)
 }
 
-func clearLogs() {
-	for i := logTable.GetRowCount() - 1; i > 0; i-- {
-		logTable.RemoveRow(i)
-	}
-	allLogs = make([]LogEntry, 0)
-	logBatch = make([]LogEntry, 0, batchSize)
-	activeLogs = 0
-	currentFilter = ""
-	input.SetText("")
-
-	updateStatusBar(0, "")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func extractCallID(message string) string {
 	lowerMsg := strings.ToLower(message)
 	if idx := strings.Index(lowerMsg, "call-id:"); idx != -1 {
@@ -686,14 +732,11 @@ func getSessionColor(callID string) tcell.Color {
 
 	colorPool := []tcell.Color{
 		tcell.NewHexColor(0xFF6B6B), // Красный
-		tcell.NewHexColor(0x4ECDC4), // Бирюзовый
 		tcell.NewHexColor(0xFFD166), // Желтый
 		tcell.NewHexColor(0x06D6A0), // Зеленый
 		tcell.NewHexColor(0x118AB2), // Синий
 		tcell.NewHexColor(0x9D4EDD), // Фиолетовый
-		tcell.NewHexColor(0xF15BB5), // Розовый
 		tcell.NewHexColor(0x00BBF9), // Голубой
-		tcell.NewHexColor(0x00F5D4), // Мятный
 		tcell.NewHexColor(0xFF9E6D), // Оранжевый
 	}
 
@@ -710,12 +753,7 @@ func getSessionRowColor(callID string, row int) tcell.Color {
 
 	r, g, b := sessionColor.RGB()
 
-	var baseGray int
-	if row%2 == 0 {
-		baseGray = 25
-	} else {
-		baseGray = 45
-	}
+	baseGray := 45
 
 	mixRatio := 0.3
 
@@ -797,4 +835,30 @@ func setRowStyle(row int, cells ...*tview.TableCell) {
 			cell.SetTextColor(textColor)
 		}
 	}
+}
+
+func updateHotBar(hotBar *tview.TextView, autoScrollEnabled bool) {
+	hotBar.SetDynamicColors(true)
+
+	f6Color := "[red]"
+	if autoScrollEnabled {
+		f6Color = "[green]"
+	}
+
+	text := fmt.Sprintf(
+		"[yellow]Esc\\Q[-] Quit   "+
+			"[green]F1[-] Help   "+
+			"[green]F3[-] Focus Filter   "+
+			"[green]F4[-] Clear Filter   "+
+			"[green]F5[-] Clear   "+
+			"%sF6[-] AutoScroll",
+		f6Color,
+	)
+
+	hotBar.SetText(text)
+}
+
+func logWithTime(level, msg string) string {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	return fmt.Sprintf("[%s] [%s] %s", ts, level, msg)
 }
